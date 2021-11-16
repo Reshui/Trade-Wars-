@@ -88,22 +88,17 @@ class Ship:
         # Determine if there is non-friendly interdictor effect active in the sector
         # Uncoded
 
+        conn = self.owner.connection
+
         start = self.current_sector
 
-        print(f'Current Sector:\t{start}')
+        send_client_message(conn, f'Current Sector:\t{start}')
 
         # Prompt user for a valid destination or to exit the menu
-        while True:
 
-            if destination == None or not destination in range(1, game.total_sectors+1):
+        prompt = f"Press 0 to return to the previous menu\nEnter target sector (1-{game.total_sectors})> "
 
-                prompt = f"Press 0 to return to the previous menu\nEnter target sector (1-{game.total_sectors})> "
-
-                end = get_input(prompt, range(1, game.total_sectors+1), True)
-
-            else:
-                end = destination
-                break
+        end = get_input(prompt, range(game.total_sectors+1), True, False, conn)
 
         if end == 0:  # If destination sector isn't given, re-display the current sector
             self.ship_sector().load_sector(
@@ -118,10 +113,11 @@ class Ship:
             sectors_to_load = breadth_first_search(start, end, game.chart)\
                 if not end in self.ship_sector().connected_sectors else [end]
 
-            print('Path: ' + " > ".join([str(element)
-                                        for element in [self.current_sector] + sectors_to_load]))
+            plotted_path = " > ".join([str(element)
+                                       for element in [self.current_sector] + sectors_to_load])
 
-            print(prompt_breaker)
+            send_client_message(
+                conn, f'Path: {plotted_path}\n{prompt_breaker}')
 
             for sector in sectors_to_load:
 
@@ -132,11 +128,9 @@ class Ship:
                     self.owner.turns_remaining -= self.warp_cost
 
                 else:
-                    print(
-                        "You don't have enough turns remaining to complete this warp.")
+                    send_client_message(
+                        conn, "You don't have enough turns remaining to complete this warp.")
                     break
-        else:
-            print("Input a valid number.")
 
     def holds_available(self):
         '''Returns the number of unused cargo holds on the ship'''
@@ -161,9 +155,9 @@ class Ship:
 
         prompt = f"Cargo Manifest:\n{df.to_string()}\n\nPress any key to continue."
 
-        get_input(prompt, None, False)
+        get_input(prompt, None, False, False, self.owner.connection)
 
-        print(prompt_breaker)
+        send_client_message(self.owner.connection, prompt_breaker)
 
     def return_cargo_quantity(self, item):
         '''Returns how much of a given item is held on the ship'''
@@ -246,8 +240,9 @@ class Ship:
         while new_sector == self.current_sector:
             new_sector = random.randint(1, game.total_sectors)
 
-        print(
-            f"You have encountered a Warp Disruptor in sector <{self.current_sector}>. Now arriving in sector <{new_sector}>")
+        prompt = f"You have encountered a Warp Disruptor in sector <{self.current_sector}>. Now arriving in sector <{new_sector}>"
+
+        send_client_message(self.owner.connection, prompt)
 
         self.change_sector(new_sector, False)
 
@@ -270,10 +265,20 @@ class Ship:
         self.ship_sector().ships_in_sector.remove(self)
         self.scrub_limpets()
         escape_pod_destroyed = False
+        conn = self.owner.connection
+
+        if conn != None:
+            send_prompt = True
+            client_msg = []
+        else:
+            send_prompt = False
+
+        client_msg = []
 
         if self.owner_in_ship:
 
-            print("Your ship has been destroyed !")
+            if send_prompt:
+                client_msg.append("Your ship has been destroyed !")
 
             if self.model == "Escape Pod":
                 self.owner.ship = None
@@ -282,11 +287,15 @@ class Ship:
                 # Deny turns for the rest of the day
             else:
                 # Place user in an Escape Pod in a random sector
-                print("Launching Escape Pods")
+                if send_prompt:
+                    client_msg.append("Launching Escape Pods")
                 escape_pod_warp = random.randint(1, game.total_sectors)
 
                 self.owner.ship = create_new_ship(
                     0, self.owner, escape_pod_warp)
+
+            if send_prompt:
+                send_client_message(conn, "\n".join(client_msg))
 
             if not escape_pod_destroyed:
 
@@ -370,11 +379,12 @@ class Ship:
         '''If the player presses "u" display available deployables and prompt for use.'''
 
         ship_items = self.useable_items
-
+        conn = self.owner.connection
         deployable_types = []
         undeployed_quantity = []
         deployed_quantity = []
         owned_in_sector = self.ship_sector().deployables_belonging_to_player_count(self.owner)
+        client_msg = []
 
         for item, quantity in ship_items.items():
             deployable_types.append(item)
@@ -386,13 +396,18 @@ class Ship:
         else:
             utilities_df = pd.DataFrame(
                 {"Deployable": deployable_types, "On Ship": undeployed_quantity, "In Sector": deployed_quantity}, index=range(1, len(deployable_types)+1))
-            print("Deployables\n")
-            print(utilities_df)
-            print("\n0 Exit\n")
+
+            client_msg.append("Deployables\n")
+            client_msg.append(utilities_df.to_string())
+            client_msg.append("\n0 Exit\n")
+
+        send_client_message(conn, "\n".join(client_msg))
+        client_msg.clear()
 
         prompt = "Select an option from the list: \t"
 
-        selection = get_input(prompt, range(len(utilities_df.index)+1), True)
+        selection = get_input(prompt, range(
+            len(utilities_df.index)+1), True, False, conn)
 
         if selection == Action.previous_menu.value:
             return
@@ -410,26 +425,25 @@ class Ship:
                 if item == "Fighters" and available_in_sector > 0:
 
                     while True:
-                        p1 = input(
-                            f"Do you want to edit the mode of {item} in the sector Y/N").lower()
 
-                        if p1 in ["y", "n"]:
+                        p1 = get_input(
+                            f"Do you want to edit the mode of {item} in the sector Y/N", ["y", "n"], False, True, conn)
 
-                            if p1 == "y":
+                        if p1 == "y":
 
-                                editing_fighter_mode = True
+                            editing_fighter_mode = True
 
-                                mode_prompt = "Select new mode: (1) offensive (2) defensive (3) taxing."
+                            mode_prompt = "Select new mode: (1) offensive (2) defensive (3) taxing."
 
-                                mode = get_input(
-                                    mode_prompt, range(4), return_number=True)
+                            mode = get_input(
+                                mode_prompt, range(4), True, False, conn)
 
-                                if mode == 0:
-                                    return
+                            if mode == 0:
+                                return
 
-                            else:
-                                editing_fighter_mode = False
-                                break
+                        else:
+                            editing_fighter_mode = False
+                            break
 
                 if not editing_fighter_mode:
 
@@ -439,7 +453,8 @@ class Ship:
 
                         multi_selection = True
 
-                        retrieve_or_deploy = get_input(prompt, range(3), True)
+                        retrieve_or_deploy = get_input(
+                            prompt, range(3), True, False, conn)
 
                         if retrieve_or_deploy == 0:
                             return
@@ -476,35 +491,32 @@ class Ship:
 
                     sector_action = "deploy" if deploying_to_sector else "retrieve"
 
-                    while True:
+                    if not editing_fighter_mode:
+                        prompt = f"How many {item} do you want to {sector_action} (0-{available_quantity})?\t"
 
-                        if not editing_fighter_mode:
-                            prompt = f"How many {item} do you want to {sector_action} (0-{available_quantity})?\t"
+                        quantity = get_input(prompt, range(
+                            available_quantity+1), True, False, conn)
 
-                            quantity = get_input(prompt, range(
-                                available_quantity+1), True)
+                        if quantity == 0:
+                            return
 
-                        if quantity in range(1, available_quantity+1) or editing_fighter_mode:
+                    self.owner.use_item(
+                        item, quantity, deploying_to_sector, not deploying_to_sector, changing_properties=editing_fighter_mode)
 
-                            self.owner.use_item(
-                                item, quantity, deploying_to_sector, not deploying_to_sector, changing_properties=editing_fighter_mode)
-                            break
-
-                        else:
-                            print("Input out of range.")
                 else:
 
                     self.owner.use_item(item, 1, True, False)
             else:
-                print(
-                    f"\n{item} aren't available with the given selection.\n")
+                send_client_message(conn,
+                                    f"\n{item} aren't available with the given selection.\n")
                 time.sleep(1)
 
     def enable_cloak(self):
         '''Cloak will remain active until user tries to exit the sector
         Will hide user from Fighters in sector.'''
         self.cloak_enabled = True
-        print("Cloak activated. Cloak will remain active until you warp out of the sector.")
+        send_client_message(
+            self.owner.connection, "Cloak activated. Cloak will remain active until you warp out of the sector.")
 
     def disable_cloak(self):
         self.cloak_enabled = False
