@@ -595,7 +595,7 @@ class Pilot:
         self.turns_remaining = turns_remaining
         self.score = score
         self.tracked_limpets = tracked_limpets
-        self.client_connection = None
+        self.connection = None
 
         # Dictionary for where deployables placed by player are in the world
         self.deployed = deployed
@@ -618,7 +618,8 @@ class Pilot:
 
     def check_input(self, action):
         '''Function is called whenever a player creates a keyboard input while sitting in a sector outside of a planet or port'''
-        print(prompt_breaker)
+
+        send_client_message(self.connection, prompt_breaker)
 
         if action == "":  # User pressed enter
             pass
@@ -637,7 +638,8 @@ class Pilot:
                 nearby_sectors = " | ".join(
                     [str(element) for element in list(self.ship_sector().connected_sectors.keys())])
 
-                print('[Nearby Warps] : ' + nearby_sectors + '\n')
+                send_client_message(self.connection,
+                                    '[Nearby Warps] : ' + nearby_sectors + '\n')
 
                 dest = None
 
@@ -673,6 +675,8 @@ class Pilot:
     def use_item(self, item, quantity, deploying_to_sector, retrieving_from_sector, mode=None, changing_properties=False):
         '''Deploy to or retrieve an item from the current sector'''
         target_sector = self.ship_sector()
+
+        conn = self.connection
 
         ship_sector = self.ship.current_sector
         # Check if persistent object
@@ -839,22 +843,14 @@ class Sector:
     def load_sector(self, player, lessen_fighter_response, process_events):
         '''Displays interactabele objects and processes hazards.'''
 
-        nearby_sectors = " - ".join(
-            [str(element) for element in list(self.connected_sectors.keys())])
+        prompt = []
+        nearby_sectors = self.connected_sectors_list()
 
-        print(
+        prompt.append(
             f'\n[Current Sector]: {self.sector}\t\t\t[Fuel remaining]: {player.turns_remaining:,}\n ')
 
-        interface_num = 1
-
         if len(self.planets) > 0:
-
-            print("*"*50)
-            print("              Planets (L)               \n")
-            for planet in self.planets:
-                print(f"{planet.name}")
-            else:
-                print(f'\n{"*"*50}\n')
+            prompt.append(self.sector_planets_view())
 
         if self.sector == 1:
             pass
@@ -863,18 +859,19 @@ class Sector:
 
             # Print the ports in the sector
             for num, port in enumerate(self.ports.values()):
-                print(f'({num+interface_num}) {port.name}\t{port.trade_status} ')
+                prompt.append(f'({num+1}) {port.name}\t{port.trade_status}')
 
-        print(
-            f'\n[Nearby Warps] : ' + nearby_sectors + '\n')
+        prompt.append(f'\n[Nearby Warps] : ' + nearby_sectors + '\n')
 
         ships = [
             ship.ship_name for ship in self.ships_in_sector if not ship.cloak_enabled]
 
         if len(ships) > 0:
-            print(str(ships)+"\n")
+            prompt.append(str(ships)+"\n")
 
-        print(prompt_breaker)
+        prompt.append(prompt_breaker)
+
+        send_client_message(player.connection, "\n".join(prompt))
 
         if process_events:
             # Deal with deployables and enviromental hazards
@@ -927,7 +924,9 @@ class Sector:
             citadel = None
 
             if planet_name == None:
-                planet_name = input("Enter planet name:\t")
+                planet_name = get_input(
+                    "Enter planet name:\t", None, False, True, planet_owner.connection)
+
             new_planet = Planet(planet_owner, self.sector, planet_type, planet_name,
                                 fighters, planet_population, planetary_shields, planet_inventory, citadel)
 
@@ -996,6 +995,22 @@ class Sector:
             if deployable.type_ == "Fighters" and player.deployable_allegiance(deployable) == False:
                 return True
 
+    def connected_sectors_list(self):
+        return " - ".join(
+            [str(element) for element in list(self.connected_sectors.keys())])
+
+    def sector_planets_view(self):
+        planet_string = []
+        planet_string.append(f'{"*"*50}')
+        planet_string.append("              Planets (L)               ")
+
+        for planet in self.planets:
+            planet_string.append(f"{planet.name}")
+        else:
+            planet_string.append(f'\n{"*"*50}\n')
+
+        return "\n".join(planet_string)
+
 
 class TradePort:
 
@@ -1058,25 +1073,28 @@ class TradePort:
             self.inventory = self.generate_info(True)
             transaction_requested = False
 
-            print(
-                f"{self.name}\tPort Funds: {round(self.credits,2):,}\t\t\tYour Balance: {round(player.credits,2):,}\n")
-
+            client_msg = []
             port_data = self.create_dataframe(player.ship)
 
-            print(port_data)
+            client_msg.appemd(
+                f"{self.name}\tPort Funds: {round(self.credits,2):,}\t\t\tYour Balance: {round(player.credits,2):,}\n")
 
-            print('\n'+prompt_breaker)
+            client_msg.append(port_data.to_string())
+
+            client_msg.append('\n'+prompt_breaker)
+
+            send_client_message(player.connection,
+                                "\n".join(client_msg))
+
+            client_msg.clear()
+
             # Ask user if they want to buy/sell or exit
-            while True:
-                try:
-                    user_selection = int(
-                        input("Select an option: (1) Buy from Port | (2) Sell to Port | (0) Exit port:   "))
-                    if user_selection in range(0, 3):
-                        break
-                except:
-                    print("Input a NUMBER 0-2")
+            prompt = "Select an option: (1) Buy from Port | (2) Sell to Port | (0) Exit port:   "
 
-            print(prompt_breaker + "\n")
+            user_selection = get_input(prompt, range(3), True, False)
+
+            send_client_message(player.connection,
+                                prompt_breaker + "\n")
 
             if user_selection == Action.sell.value:
                 buy_bool = False
@@ -1086,17 +1104,17 @@ class TradePort:
                 transaction_requested = True
             elif user_selection == Action.previous_menu.value:
                 break
-            else:
-                print("Invalid selection")
 
             if transaction_requested:
                 self.buy_sell_prompt(buy_bool, player, port_data)
 
-            print(prompt_breaker)
+            send_client_message(player.connection,
+                                prompt_breaker + "\n")
 
     def buy_sell_prompt(self, player_buying_status, player, inventory_df):
 
         player_ship = player.ship
+        conn = player.connection
 
         sell_or_buy = "buy" if player_buying_status == True else "sell"
 
@@ -1124,24 +1142,32 @@ class TradePort:
 
         if available_for_purchase == 0:  # Check if trades aren't possible
             self.tell_user_no_trades_possible(
-                items_on_ship, ship_holds_are_full, player_buying_status)
+                items_on_ship, ship_holds_are_full, player_buying_status, conn)
             return
         else:
             choice_df.drop("Status", axis=1, inplace=True)
             choice_df.reset_index(level=0, inplace=True)
             choice_df.rename(columns={"index": "Commodity"}, inplace=True)
             choice_df.index = range(1, available_for_purchase+1)
-            print(choice_df)
 
-            print(f"\n0 Exit Menu\n{prompt_breaker}")
+            client_msg = []
+
+            client_msg.append(choice_df.to_string())
+
+            client_msg.append(f"\n0 Exit Menu\n{prompt_breaker}")
+
+            send_client_message(conn,
+                                "\n".join(client_msg))
+
+            client_msg.clear()
 
             selection = self.prompt_for_item_selection(
-                available_for_purchase, sell_or_buy)
+                available_for_purchase, sell_or_buy, conn)
 
             if selection == Action.previous_menu.value:  # Equal to 0
                 return
             else:
-                print(prompt_breaker)
+
                 commodity = choice_df.at[selection, "Commodity"]
                 commodity_price = self.inventory[commodity]['Price']
 
@@ -1155,10 +1181,12 @@ class TradePort:
                 purchasable_units = min(
                     cargo_limit, buyer_can_afford, self.inventory[commodity]['Quantity'])
 
+                send_client_message(conn, prompt_breaker)
+
                 while True:  # Prompt user for how much they'd like to trade
                     # Show them how many credits they will gain or lose
                     quantity = self.prompt_for_trade_quantity(
-                        sell_or_buy, purchasable_units, commodity)
+                        sell_or_buy, purchasable_units, commodity, conn)
 
                     if quantity == 0:
                         return
@@ -1168,7 +1196,7 @@ class TradePort:
                     prompt = f'\nCurrent Balance: {round(player.credits,2):,} || New Balance: {round(player.credits + (-1* transaction_cost if player_buying_status else transaction_cost),2) :,} || Change: {sign} {round(transaction_cost,2):,}\n'
                     prompt += "Press [Enter] to confirm or [0] to cancel transaction."
 
-                    selection = get_input(prompt, None, False)
+                    selection = get_input(prompt, None, False, conn)
 
                     if selection == "":  # Transaction details have been confirmed
                         break
@@ -1250,34 +1278,27 @@ class TradePort:
 
         return " ".join(commodity_statuses)
 
-    def prompt_for_item_selection(self, available_trades_count, transaction_type):
+    def prompt_for_item_selection(self, available_trades_count, transaction_type, conn):
 
-        while True:  # Prompt player for which item they would like to buy or sell
-            try:
-                item_selection_number = int(
-                    input(f"What would you like to {transaction_type} (0 - {available_trades_count})?\t"))
+        prompt = f"What would you like to {transaction_type} (0 - {available_trades_count})?\t"
 
-                if item_selection_number in range(available_trades_count+1):
-                    break
-                else:
-                    print(
-                        f"\nInput a number 0 - {available_trades_count}")
-            except ValueError:
-                print("Input a number.")
+        item_selection_number = get_input(
+            prompt, range(available_trades_count+1), True, False, conn)
 
         return item_selection_number
 
-    def prompt_for_trade_quantity(self, transaction_type, units_available, commodity_name):
+    def prompt_for_trade_quantity(self, transaction_type, units_available, commodity_name, conn):
 
         prompt = f'{commodity_name} units available for purchase: {units_available:,}\n\nHow many units would you like to {transaction_type}?\t'
 
         quantity = get_input(prompt, range(
-            units_available+1), True, False)
+            units_available+1), True, False, conn)
 
         return quantity
 
-    def tell_user_no_trades_possible(self, cargo_on_ship, holds_are_full, player_is_buying):
+    def tell_user_no_trades_possible(self, cargo_on_ship, holds_are_full, player_is_buying, conn):
         '''Need to add feature to check if port requested items >0'''
+
         if not player_is_buying:
 
             if cargo_on_ship:
@@ -1530,11 +1551,13 @@ def create_basic_pilot(player_name):
     return user
 
 
-def get_input(prompt, allowed_range, return_number, return_lowered_string=False):
+def get_input(prompt, allowed_range, return_number, return_lowered_string, conn):
 
     while True:
 
-        user_input = input(prompt)
+        send_client_message(conn, prompt)
+
+        user_input = recieve_from_client(conn)
 
         if return_number:
 
@@ -1582,7 +1605,7 @@ def recieve_from_client(client):
 
 
 def handle_client(conn):
-    # get username and assign pilot object
+    '''Prompt for user name and asssign Pilot object.'''
 
     username_prompt = "Enter Username"
 
@@ -1599,6 +1622,8 @@ def handle_client(conn):
             game.players[pilot.name] = pilot
 
         game.active_players.append(pilot.name)
+
+        pilot.connection = conn
 
     else:
         return
