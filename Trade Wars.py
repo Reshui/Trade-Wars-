@@ -5,8 +5,8 @@ import time
 import collections
 import pandas as pd
 import heapq
-# import threading
-# import socket
+import threading
+import socket
 
 prompt_breaker = "=" * 96
 
@@ -24,11 +24,33 @@ for utility in ["Photon Ammo", "Planet Crackers", "Planet Generators", "Cloaking
 default_cargo = {'Ore': [], "Organics": [],
                  "Equipment": [], 'Armor': [], "Batteries": []}
 
+FORMAT = "utf-8"
+HEADER = 64
+DISCONNECT_MESSAGE = "!DISCONNECT"
+
 
 class Action(Enum):
     previous_menu = 0
     buy = 1
     sell = 2
+
+
+class FighterModes(Enum):
+    offensive = 1
+    defensive = 2
+    taxing = 3
+    disabled = 4
+
+
+class LocalNetwork:
+
+    def __init__(self):
+        self.port = 5050
+        self.server_ip = socket.gethostbyname(socket.gethostname())
+        self.addr = (self.server, self.port)
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind(self.addr)
+        self.connected_clients = []
 
 
 class Ship:
@@ -55,7 +77,7 @@ class Ship:
         self.destroyed = False
         self.shields = shields
 
-        initialized_sector = map_[self.current_sector].ships_in_sector
+        initialized_sector = game.chart[self.current_sector].ships_in_sector
 
         if not self in initialized_sector:
             initialized_sector.append(self)
@@ -75,13 +97,10 @@ class Ship:
 
             if destination == None or not destination in range(1, game.total_sectors+1):
 
-                try:
-                    print("Press 0 to return to the previous menu")
-                    end = int(
-                        input("Enter target sector (1-{})> ".format(game.total_sectors)))
-                    break
-                except:
-                    print("Please input a number.")
+                prompt = f"Press 0 to return to the previous menu\nEnter target sector (1-{game.total_sectors})> "
+
+                end = get_input(prompt, range(1, game.total_sectors+1), True)
+
             else:
                 end = destination
                 break
@@ -93,10 +112,10 @@ class Ship:
 
         elif end in range(1, game.total_sectors+1):
 
-            #shortest_fuel_path = dijkstra_path(start, end, map_)
+            #shortest_fuel_path = dijkstra_path(start, end, game.chart)
 
             # If more than 1 warp required to reach the destination use BFS
-            sectors_to_load = breadth_first_search(start, end, map_)\
+            sectors_to_load = breadth_first_search(start, end, game.chart)\
                 if not end in self.ship_sector().connected_sectors else [end]
 
             print('Path: ' + " > ".join([str(element)
@@ -128,21 +147,21 @@ class Ship:
 
     def show_cargo(self):
         '''Prints a pandas DataFrame representing the ship's cargo manifest'''
-        print("Cargo Manifest:\n")
 
-        ship_inventory = {}
-        keys = []
-        quantity = []
-        wap = []
-        for key, quant in self.cargo.items():
+        ship_inventory, keys, quantity, wap = {}, [], [], []
+
+        for key in self.cargo:
             keys.append(key)
             quantity.append(self.return_cargo_quantity(key))
             wap.append(self.weighted_average_price(key))
 
         ship_inventory = {"Quantity": quantity, "Weighted Avg Price": wap}
 
-        print(pd.DataFrame(ship_inventory, index=keys))
-        input("\nPress any key to continue.")
+        df = pd.DataFrame(ship_inventory, index=keys)
+
+        prompt = f"Cargo Manifest:\n{df.to_string()}\n\nPress any key to continue."
+
+        get_input(prompt, None, False)
 
         print(prompt_breaker)
 
@@ -161,8 +180,8 @@ class Ship:
         if mines_used == 0:
             mines_used = 1
 
-        mines.edit_amount_in_sector(
-            mines_used, return_to_inventory=False)
+        mines.deploy_or_retrieve_item(
+            mines_used, False, False, False)
 
         induced_damage = mines_used * mine_damage
 
@@ -213,8 +232,8 @@ class Ship:
         '''
         new_limpet = Limpet(self, limpets.owner)
 
-        limpets.edit_amount_in_sector(-1,
-                                      return_to_inventory=False)
+        limpets.deploy_or_retrieve_item(1,
+                                        False, False, False)
 
         self.attached_limpets.append(new_limpet)
 
@@ -231,6 +250,19 @@ class Ship:
             f"You have encountered a Warp Disruptor in sector <{self.current_sector}>. Now arriving in sector <{new_sector}>")
 
         self.change_sector(new_sector, False)
+
+    def fighter_interactions(self, fighters):
+
+        if fighters.mode == FighterModes.offensive:
+            fighters.attack_ship(self)
+            pass
+        elif fighters.mode == FighterModes.defensive:
+            # Don't permit ship interaction with objects in sector until fighters are destroyed
+            pass
+        else:
+            # Charge a credit/cargo/cargo holds tax
+            # If player can't pay then attack
+            pass
 
     def ship_destroyed(self, destroyer, mines, fighters, sci_fi):
         ''''Function handles ship destruction events regardless of owner presence.'''
@@ -280,7 +312,7 @@ class Ship:
 
     def ship_sector(self):
         '''Returns the object representing the sector the ship is currently in.'''
-        return map_[self.current_sector]
+        return game.chart[self.current_sector]
 
     def scrub_limpets(self, captured_ship_new_owner=None):
         '''Remove Limpet Mines from hull. Optional arguement permits scraping only from a certain user
@@ -347,8 +379,10 @@ class Ship:
         for item, quantity in ship_items.items():
             deployable_types.append(item)
             undeployed_quantity.append(quantity)
-            deployed_quantity.append(owned_in_sector[item])
-
+            try:
+                deployed_quantity.append(owned_in_sector[item])
+            except KeyError:
+                deployed_quantity.append(0)
         else:
             utilities_df = pd.DataFrame(
                 {"Deployable": deployable_types, "On Ship": undeployed_quantity, "In Sector": deployed_quantity}, index=range(1, len(deployable_types)+1))
@@ -356,13 +390,9 @@ class Ship:
             print(utilities_df)
             print("\n0 Exit\n")
 
-        while True:
-            try:
-                selection = int(input("Select an option from the list: \t"))
-                if selection in range(len(utilities_df.index)+1):
-                    break
-            except ValueError:
-                print("Input a number.")
+        prompt = "Select an option from the list: \t"
+
+        selection = get_input(prompt, range(len(utilities_df.index)+1), True)
 
         if selection == Action.previous_menu.value:
             return
@@ -373,80 +403,98 @@ class Ship:
             available_on_ship = utilities_df.at[selection, "On Ship"]
             multi_selection = False
             deploying_to_sector = False
+            editing_fighter_mode = False
 
             if item in default_deployed.keys():
-                # If item can be deployed into a sector
-                if available_in_sector > 0 and available_on_ship > 0:
 
-                    multi_selection = True
+                if item == "Fighters" and available_in_sector > 0:
+
                     while True:
-                        try:
-                            retrieve_or_deploy = int(input(
-                                "Do you want to <1> retrieve or <2> deploy {item} in the sector"))
-                            if retrieve_or_deploy in range(3):
+                        p1 = input(
+                            f"Do you want to edit the mode of {item} in the sector Y/N").lower()
+
+                        if p1 in ["y", "n"]:
+
+                            if p1 == "y":
+
+                                editing_fighter_mode = True
+
+                                mode_prompt = "Select new mode: (1) offensive (2) defensive (3) taxing."
+
+                                mode = get_input(
+                                    mode_prompt, range(4), return_number=True)
+
+                                if mode == 0:
+                                    return
+
+                            else:
+                                editing_fighter_mode = False
                                 break
-                        except ValueError:
-                            print("Select a number from the given options.")
 
-                    if retrieve_or_deploy == 0:
-                        return
+                if not editing_fighter_mode:
 
-                    deploying_to_sector = True if retrieve_or_deploy == 2 else False
+                    if available_in_sector > 0 and available_on_ship > 0:
 
-                if ((multi_selection and deploying_to_sector) or not multi_selection) and available_on_ship > 0:
+                        prompt = f"Do you want to <1> retrieve or <2> deploy {item} in the sector"
 
-                    available_quantity = available_on_ship
-                    deploying_to_sector = True
+                        multi_selection = True
 
-                elif ((multi_selection and not deploying_to_sector) or not multi_selection) and available_in_sector > 0:
+                        retrieve_or_deploy = get_input(prompt, range(3), True)
 
-                    available_quantity = available_in_sector
-                    deploying_to_sector = False
+                        if retrieve_or_deploy == 0:
+                            return
+                        else:
+                            deploying_to_sector = True if retrieve_or_deploy == 2 else False
+                            editing_fighter_mode = True if retrieve_or_deploy == 3 else False
 
-                else:
-                    available_quantity = 0
+                    if ((multi_selection and deploying_to_sector) or not multi_selection) and available_on_ship > 0:
+
+                        available_quantity = available_on_ship
+                        deploying_to_sector = True
+
+                    elif ((multi_selection and not deploying_to_sector) or not multi_selection) and available_in_sector > 0:
+
+                        available_quantity = available_in_sector
+                        deploying_to_sector = False
+
+                    elif editing_fighter_mode:
+
+                        available_quantity = available_in_sector and available_in_sector > 0
+                        deploying_to_sector = False
+
+                    else:
+
+                        available_quantity = 0
 
             else:
                 # Utility is consumed upon use
                 available_quantity = available_on_ship
 
-            if available_quantity > 0:
+            if available_quantity > 0 or editing_fighter_mode:
 
                 if item in default_deployed.keys():
 
                     sector_action = "deploy" if deploying_to_sector else "retrieve"
 
-                    editing_deployed_quantity = True if self.current_sector in self.owner.deployed[
-                        item] else False
-
                     while True:
-                        try:
-                            quantity = int(
-                                input(f"How many {item} do you want to {sector_action} (0-{available_quantity})?\t"))
-                        except ValueError:
-                            print("Input a number.")
-                            continue
 
-                        if quantity in range(0, available_quantity+1):
+                        if not editing_fighter_mode:
+                            prompt = f"How many {item} do you want to {sector_action} (0-{available_quantity})?\t"
 
-                            if quantity != 0:
+                            quantity = get_input(prompt, range(
+                                available_quantity+1), True)
 
-                                if item == "Fighters":
-                                    pass  # Prompt player for deployment mode
+                        if quantity in range(1, available_quantity+1) or editing_fighter_mode:
 
-                                if not deploying_to_sector:  # negative quantities will place the item back onboard the ship
-                                    quantity *= -1
+                            self.owner.use_item(
+                                item, quantity, deploying_to_sector, not deploying_to_sector, changing_properties=editing_fighter_mode)
+                            break
 
-                                self.owner.use_item(
-                                    item, quantity, changing_quantity=editing_deployed_quantity)
-                                break
-                            else:
-                                return
                         else:
                             print("Input out of range.")
                 else:
 
-                    self.owner.use_item(item, quantity=1)
+                    self.owner.use_item(item, 1, True, False)
             else:
                 print(
                     f"\n{item} aren't available with the given selection.\n")
@@ -479,29 +527,49 @@ class Deployable:
 
         owner.ship_sector().place_deployable_in_sector(self)
 
-        owner.add_tracked_deployable(self)
-
-    def edit_amount_in_sector(self, quantity, return_to_inventory=False):
+    def deploy_or_retrieve_item(self, quantity, deploying_to_sector, friendly_inteaction, retrieving_from_sector=False):
         '''Edits quantity of the specified deployable...deletes from sector and player logs if quantity reaches 0.'''
 
-        self.quantity += quantity  # Quantity can be positive or negative.
+        if friendly_inteaction:
 
-        if quantity > 0:
-            # Deployables are being added to the sector
-            self.owner.ship.useable_items[self.type_] -= quantity
-
-        elif return_to_inventory:
-            # If the owner of the item is retrieveing the deployable from a sector.
-            self.owner.ship.useable_items[self.type_] -= quantity
+            if deploying_to_sector:
+                # Deployables are being added to the sector
+                self.owner.ship.useable_items[self.type_] -= quantity
+                self.quantity += quantity
+            elif retrieving_from_sector:
+                # If the owner of the item is retrieveing the deployable from a sector.
+                self.owner.ship.useable_items[self.type_] += quantity
+                self.quantity -= quantity
+        else:
+            self.quantity -= quantity
 
         if self.quantity <= 0:
             # If the deployed quantity has been exhausted.
-            self.deployed_sector().deployed_items.remove(self)
-            del self.owner.deployed[self.type_][self.sector_num]
+            self.deployable_exhausted()
 
     def deployed_sector(self):
         '''Returns the object representing the sector the deployable is in.'''
-        return map_[self.sector_num]
+        return game.chart[self.sector_num]
+
+    def deployable_exhausted(self):
+        '''Function removes the deployable from the sector and from the owner's tracked deployables.'''
+        self.deployed_sector().deployed_items.remove(self)
+        del self.owner.deployed[self.type_][self.sector_num]
+
+    def attack_ship(self, ship):
+        '''Function used when fighters deployed to a sector are attacking a ship.'''
+
+        fighters_on_ship = ship.useable_items["Fighters"]
+        fighters_in_sector = self.quantity
+
+        ship.useable_items["Fighters"] -= fighters_in_sector
+        self.quantity -= fighters_on_ship
+
+        if self.quantity <= 0:
+            self.deployable_exhausted()
+
+        if ship.useable_items["Fighters"] < 0:
+            ship.ship_destroyed(self.owner, False, True, False)
 
 
 class Limpet:
@@ -519,68 +587,34 @@ class Limpet:
 class Pilot:
 
     def __init__(self, name, player_credits,
-                 turns_remaining, score, deployed, corporation, tracked_limpets, ship):
+                 turns_remaining, score, deployed, corporation, tracked_limpets, new_life, ship=None):
 
         self.name = name
         self.corporation = corporation
-        # self.current_sector = current_sector
         self.credits = player_credits
         self.turns_remaining = turns_remaining
         self.score = score
-        self.ship = ship
+        self.tracked_limpets = tracked_limpets
+        self.client_connection = None
 
         # Dictionary for where deployables placed by player are in the world
         self.deployed = deployed
-        self.tracked_limpets = tracked_limpets
 
-    def use_item(self, item, quantity, mode=None, changing_quantity=False, changing_properties=False):
-        '''Use,edit or add a useble item to the current sector.'''
-        target_sector = self.ship_sector()
+        if ship == None:
 
-        ship_sector = self.ship.current_sector
-
-        if item in default_deployed.keys():
-            # Check if player already has deployables of that type in the sector
-            if ship_sector in self.deployed[item]:
-
-                deployed_item = self.deployed[item][ship_sector]
-
-                if changing_quantity:
-                    deployed_item.edit_amount_in_sector(quantity, True)
-                elif changing_properties:
-                    # Used for editing deployed fighter status
-                    pass
+            if new_life:
+                # User already has a planet.. start them in Fed Space since they died
+                starting_sector = random.randint(1, 20)
             else:
-                placed_deployable = Deployable(
-                    self, item, ship_sector, quantity, mode)
+                # New user detected
+                starting_sector = random.randint(40, len(game.chart))
 
-        elif item == "Planet Crackers":
-            #   Planet Cracker
-            available_planets = target_sector.planets_in_sector()
+                self.ship = create_new_ship(new_ship_class=1, owner=self,
+                                            spawn_sector=starting_sector)
 
-            if len(available_planets) > 0:
-                # Print out the names of each planet and prompt user for selection
-                # Destroy planet if no defenses
-                pass
-        elif item == "Photon Ammo":
-            # Photon Cannon
-            # Launches turn denial weapon
-            # Disables Quasar cannons temporarily for 20 seconds
-            pass
-        elif item == "Planet Generators":
-            target_sector.create_planet(planet_owner=self)
-        elif item == "Cloaking Device":
-            self.ship.enable_cloak()
-        elif item == "Density Scanners":
-            pass
-
-        if not changing_quantity:  # If not modifying the quantity of an already existing deployable
-            # Then remove the utility from the ship
-            self.ship.useable_items[item] -= quantity
-
-    def add_to_avoid_list(self, new_sector):
-        pass
-        # self.avoided_sectors.append(new_sector)
+                self.create_home_world()
+        else:
+            self.ship = ship
 
     def check_input(self, action):
         '''Function is called whenever a player creates a keyboard input while sitting in a sector outside of a planet or port'''
@@ -620,35 +654,116 @@ class Pilot:
         elif action[0] == "a":
             # Choose object to attack
             pass
+        elif action[0] == "l":
+            # land on planet
+            pass
         elif action.isdigit():  # Used for entering Ports or Planets
 
-            action = int(action)
+            if not self.ship_sector().foreign_fighters_in_sector(self):
+                action = int(action)
 
-            try:
-                sector_obj = self.ship_sector()
-                sector_obj.ports[action].enter_port(self)
-                sector_obj.load_sector(
-                    self, lessen_fighter_response=True, process_events=False)
-            except KeyError:
+                try:
+                    sector_obj = self.ship_sector()
+                    sector_obj.ports[action].enter_port(self)
+                    sector_obj.load_sector(
+                        self, lessen_fighter_response=True, process_events=False)
+                except KeyError:
+                    pass
+
+    def use_item(self, item, quantity, deploying_to_sector, retrieving_from_sector, mode=None, changing_properties=False):
+        '''Deploy to or retrieve an item from the current sector'''
+        target_sector = self.ship_sector()
+
+        ship_sector = self.ship.current_sector
+        # Check if persistent object
+        if item in default_deployed.keys():
+            # Check if player already has deployables of that type in the sector
+            if ship_sector in self.deployed[item]:
+
+                deployed_item = self.deployed[item][ship_sector]
+
+                if deploying_to_sector or retrieving_from_sector:
+
+                    deployed_item.deploy_or_retrieve_item(
+                        quantity, deploying_to_sector, True, retrieving_from_sector)
+
+                elif changing_properties:
+                    # Used for editing deployed fighter status
+                    deployed_item.mode = mode
+
+            elif deploying_to_sector:
+                # Create deployable,add it to the current sector and track it
+                self.add_tracked_deployable(Deployable(
+                    self, item, ship_sector, quantity, mode))
+
+        elif item == "Planet Crackers":
+
+            available_planets = target_sector.planets_in_sector()
+
+            if len(available_planets) > 0:
+                # Print out the names of each planet and prompt user for selection
+                # Destroy planet if no defenses
                 pass
+        elif item == "Photon Ammo":
+            # Launches turn denial weapon
+            # Disables Quasar cannons temporarily for 20 seconds
+            pass
+        elif item == "Planet Generators":
+            target_sector.create_planet(planet_owner=self)
+        elif item == "Cloaking Device":
+            self.ship.enable_cloak()
+        elif item == "Density Scanners":
+            pass
 
-    def ship_sector(self):
-        '''Returns sector object containing pilot's ship'''
-        return map_[self.ship.current_sector]
-
-    def assign_ship(self, ship):
-        ship.owner = self
-        self.ship = ship
+        # Then remove the utility from ship
+        if deploying_to_sector:
+            self.ship.useable_items[item] -= quantity
 
     def add_tracked_deployable(self, deployable):
         '''Adds a given deployable to a pilot's deployed list for tracking'''
         # Create dictionary value using the item type and current sector as a key. Function is called when a new instance of Deployable is made
         self.deployed[deployable.type_][deployable.sector_num] = deployable
 
+    def add_to_avoid_list(self, new_sector):
+        pass
+        # self.avoided_sectors.append(new_sector)
+
+    def ship_sector(self):
+        '''Returns sector object containing pilot's ship'''
+        return game.chart[self.ship.current_sector]
+
     def claim_ship(self, ship):
         ship.owner = self
 
     def display_deployed(self):
+        pass
+
+    def deployable_allegiance(self, deployable):
+        '''Returns whether or not a given deployable is hostile to the player.'''
+
+        friendly = True if self is deployable.owner\
+            or (deployable.owner.corporation == self.corporation
+                and deployable.owner.corporation != None
+                and self.corporation != None)\
+            else False
+
+        return friendly
+
+    def create_home_world(self):
+
+        planet_inventory = {'Ore': 0, "Organics": 0,
+                            "Equipment": 0, 'Armor': 0, "Batteries": 0}
+
+        planet_population = dict.fromkeys(planet_inventory, 1000)
+
+        planet_class = random.randint(1, 9)
+
+        new_planet = Planet(self, self.ship_sector(), planet_class, self.name +
+                            "'s Home World", 2000, planet_population, 100, planet_inventory, None)
+
+        self.ship_sector().planets.append(new_planet)
+
+    def send_to_client(self, text):
         pass
 
 
@@ -734,12 +849,12 @@ class Sector:
 
         if len(self.planets) > 0:
 
-            print("*"*20)
-            print("              Planets                \n")
+            print("*"*50)
+            print("              Planets (L)               \n")
             for planet in self.planets:
                 print(f"{planet.name}")
             else:
-                print(f'\n{"*"*20}\n')
+                print(f'\n{"*"*50}\n')
 
         if self.sector == 1:
             pass
@@ -799,7 +914,7 @@ class Sector:
                     self.sector, port_number)
         return sector_ports
 
-    def create_planet(self, planet_owner, planet=None):
+    def create_planet(self, planet_owner, planet=None, planet_name=None):
 
         if planet == None:
 
@@ -811,7 +926,9 @@ class Sector:
             planet_type = random.randint(1, 9)
             citadel = None
 
-            new_planet = Planet(planet_owner, self.sector, planet_type, input("Enter planet name:\t"),
+            if planet_name == None:
+                planet_name = input("Enter planet name:\t")
+            new_planet = Planet(planet_owner, self.sector, planet_type, planet_name,
                                 fighters, planet_population, planetary_shields, planet_inventory, citadel)
 
             self.planets.append(new_planet)
@@ -834,13 +951,7 @@ class Sector:
         '''Function handles hazardous events'''
         for deployable in self.deployed_items:
 
-            friendly = True if victim is deployable.owner\
-                or (deployable.owner.corporation == victim.corporation
-                    and deployable.owner.corporation != None
-                    and victim.corporation != None)\
-                else False
-
-            if not friendly:
+            if not victim.deployable_allegiance(deployable):
 
                 if deployable.type == "Limpets":
                     victim.ship.limpet_interaction(deployable)
@@ -868,7 +979,7 @@ class Sector:
         '''Returns a dictionary containing how much of each type of deployable object
          a player has placed in a sector'''
 
-        deployed_in_sector = dict.fromkeys(default_undeployed, 0)
+        deployed_in_sector = dict.fromkeys(default_deployed, 0)
 
         for deployable in self.deployed_items:
             if deployable.owner == player:
@@ -880,46 +991,63 @@ class Sector:
         '''Returns a pandas DataFrame that contains density values for a sector.'''
         pass
 
+    def foreign_fighters_in_sector(self, player):
+        for deployable in self.deployed_items:
+            if deployable.type_ == "Fighters" and player.deployable_allegiance(deployable) == False:
+                return True
+
 
 class TradePort:
 
-    def __init__(self, sector, port_number):
+    def __init__(self, sector, port_number, initial_inventory=None):
         self.sector = sector
         self.name = 'Trading Port {} ~ {}'.format(sector, port_number)
-        # Fuel for ship/Planetary shields
+        self.original = initial_inventory
         self.credits = random.randint(20_510_000, 90_700_000)
         self.inventory = self.generate_info(False)
         self.trade_status = self.port_trades_available()
 
     def generate_info(self, update_only_prices=False):
+        '''Used to generate original inventory and prices as well as update prices to reflect
+         current inventory when the optional arguement is set to True.
+         '''
 
-        if not update_only_prices:
-            info = {}
+        if self.original == None:
+            # Prices are being generated for the first time
+            info = {key: {} for key in default_cargo}
 
-            for field in ["Ore", "Organics", "Armor", "Batteries", "Equipment"]:
-                info[field] = {}
+            self.original = {}
+
+            # (Quantity Range),(Price Modifier,Bsse cost)
+            self.original["Ore"] = (
+                30_000, 150_000), (1000, random.randint(200, 300))
+            self.original["Organics"] = (
+                40_000, 200_000), (2000, random.randint(100, 200))
+            self.original["Armor"] = (
+                60_000, 100_000), (500, random.randint(978, 1500))
+            self.original["Batteries"] = (
+                10_000, 45_000), (15000, random.randint(9, 12))
+            self.original["Equipment"] = (
+                5_000, 10_000), (800, random.randint(3000, 4000))
         else:
             info = self.inventory
 
-        quantities = [(30_000, 150_000), (40_000, 200_000),
-                      (60_000, 100_000), (10_000, 45_000), (5_000, 10_000)]
+        for commodity, item in info.items():
 
-        if not update_only_prices:
-            self.price_random = ((1000, random.randint(200, 300)), (2000, random.randint(100, 200)),
-                                 (500, random.randint(978, 1500)), (15000, random.randint(9, 12)), (800, random.randint(3000, 4000)))
-
-        for item, amount, price in zip(info.values(), quantities, self.price_random):
+            base = self.original[commodity]
 
             if not update_only_prices:
-                item['Quantity'] = random.randint(*amount)
+                item["Quantity"] = random.randint(*base[0])
                 item['Status'] = random.choice(("Buying", "Selling"))
 
             if item['Status'] == "Selling":
                 # Higher prices with smaller WTS
-                item["Price"] = round(price[1] - item['Quantity']/price[0], 3)
+                item["Price"] = round(
+                    base[1][1] - item['Quantity']/base[1][0], 3)
             else:
                 # Lower Prices with smaller WTB
-                item["Price"] = round(item['Quantity']/price[0] + price[1], 3)
+                item["Price"] = round(
+                    item['Quantity']/base[1][0] + base[1][1], 3)
 
         return info
 
@@ -1019,10 +1147,10 @@ class TradePort:
 
                 if player_buying_status:
                     cargo_limit = player_ship.holds_available()
-                    buyer_can_afford = int(player.credits/commodity_price)
+                    buyer_can_afford = int(player.credits//commodity_price)
                 else:
                     cargo_limit = choice_df.at[selection, "Ship Inventory"]
-                    buyer_can_afford = int(self.credits/commodity_price)
+                    buyer_can_afford = int(self.credits//commodity_price)
 
                 purchasable_units = min(
                     cargo_limit, buyer_can_afford, self.inventory[commodity]['Quantity'])
@@ -1037,11 +1165,10 @@ class TradePort:
 
                     transaction_cost = commodity_price * quantity
 
-                    print(
-                        f'\nCurrent Balance: {round(player.credits,2):,} || New Balance: {round(player.credits + (-1* transaction_cost if player_buying_status else transaction_cost),2) :,} || Change: {sign} {round(transaction_cost,2):,}\n')
+                    prompt = f'\nCurrent Balance: {round(player.credits,2):,} || New Balance: {round(player.credits + (-1* transaction_cost if player_buying_status else transaction_cost),2) :,} || Change: {sign} {round(transaction_cost,2):,}\n'
+                    prompt += "Press [Enter] to confirm or [0] to cancel transaction."
 
-                    selection = input(
-                        "Press [Enter] to confirm or [0] to cancel transaction.")
+                    selection = get_input(prompt, None, False)
 
                     if selection == "":  # Transaction details have been confirmed
                         break
@@ -1093,6 +1220,7 @@ class TradePort:
 
     def create_dataframe(self, player_ship):
         '''Creates a pandas Dataframe that shows the ports inventory and trading status.'''
+
         status, price, ship_inventory, keys, player_averae_bought_price, quantity_requested = [
         ], [], [], [], [], []
 
@@ -1116,7 +1244,7 @@ class TradePort:
         return port_df
 
     def port_trades_available(self):
-        '''Return first character of the trade status for each commodity in alphabetical order'''
+        '''Return first character of each commodities trade status in alphabetical order.'''
         commodity_statuses = [self.inventory[commodity]["Status"][0]
                               for commodity in sorted(self.inventory.keys())]
 
@@ -1141,23 +1269,11 @@ class TradePort:
 
     def prompt_for_trade_quantity(self, transaction_type, units_available, commodity_name):
 
-        print(
-            f'{commodity_name} units available for purchase: {units_available:,}')
+        prompt = f'{commodity_name} units available for purchase: {units_available:,}\n\nHow many units would you like to {transaction_type}?\t'
 
-        while True:
-            try:
-                quantity = int(
-                    input(f"\nHow many units would you like to {transaction_type}?\t"))
+        quantity = get_input(prompt, range(
+            units_available+1), True, False)
 
-                if quantity <= 0:
-                    return 0
-                elif quantity > units_available:
-                    print(
-                        f"Input a quantity between 0 and {units_available:,}")
-                else:
-                    break
-            except ValueError:
-                print("Input a number.")
         return quantity
 
     def tell_user_no_trades_possible(self, cargo_on_ship, holds_are_full, player_is_buying):
@@ -1183,17 +1299,22 @@ class TradePort:
 
 class Game:
 
-    def __init__(self, chart, players, deployables):
+    def __init__(self, chart, saved_players=None):
 
-        self.players = players
-        self.map_ = chart
+        if saved_players == None:
+            self.saved_players = {}
+        else:
+            self.saved_players = saved_players
+
+        self.chart = chart
         self.total_sectors = len(chart)
+        self.active_players = []
 
-    def return_player(self, player_name):
-        self.players[player_name]
+    def add_player(self, new_player):
+        self.players[new_player.name] = new_player
 
 
-def join_all_sectors(total_sectors, current_map):
+def join_all_sectors(current_map):
     '''
     Use Depth First Search algorithm to ensure all sectors are connected
     '''
@@ -1261,13 +1382,10 @@ def breadth_first_search(start, end, current_map):
     Optimal to use this with previous clause if the number of sectors is large
     '''
     queue = collections.deque([start])
-    visited = set()
+    visited, previous_node, nodes_reached = set(), dict(), set()
 
-    nodes_reached = {start}
-    pred = {}
-    end_node_found = False
+    while queue:
 
-    while queue and not end_node_found:
         node = queue.popleft()
         visited.add(node)
 
@@ -1276,10 +1394,10 @@ def breadth_first_search(start, end, current_map):
             # Checking if in nodes_reached is an optimization step to avoid repeatedly overwriting and adding the same node to the queue
             if not connected_node in visited and not connected_node in nodes_reached:
 
-                pred[connected_node] = node
+                previous_node[connected_node] = node
 
                 if connected_node == end:
-                    end_node_found = True
+                    queue.clear()
                     break
                 else:
                     nodes_reached.add(connected_node)
@@ -1292,7 +1410,7 @@ def breadth_first_search(start, end, current_map):
     try:
         while connected_node != start:
             path.appendleft(connected_node)
-            connected_node = pred[connected_node]
+            connected_node = previous_node[connected_node]
     except KeyError:
         return []
 
@@ -1300,9 +1418,8 @@ def breadth_first_search(start, end, current_map):
 
 
 def dijkstra_path(start, end, current_map):
-    '''
-    Dijkstra's algorithm used to find shortest fuel cost path. 
-    '''
+    '''Dijkstra's algorithm used to find shortest fuel cost path. '''
+
     node_cost = dict.fromkeys(current_map, np.inf)
 
     node_cost[start], destination_cost, predecessor, visited = 0, np.inf, dict(), set()
@@ -1324,19 +1441,18 @@ def dijkstra_path(start, end, current_map):
                 if connected_node == end:
                     # Don't place destination node in the heap
                     destination_cost = path_cost
-
                 elif not connected_node in visited:
                     heapq.heappush(heap, (path_cost, connected_node))
         else:
             visited.add(min_node)
 
-    currentNode = end
+    connected_node = end
     path = collections.deque([])
 
-    while currentNode != start:
+    while connected_node != start:
         try:
-            path.appendleft(currentNode)
-            currentNode = predecessor[currentNode]
+            path.appendleft(connected_node)
+            connected_node = predecessor[connected_node]
         except KeyError:
             print("Path not reachable")
             break
@@ -1357,7 +1473,7 @@ def generate_map(total_sectors=100):
             current_sector, game_sectors_total=total_sectors)
 
     # Ensure that every sector is reachable
-    current_map = join_all_sectors(total_sectors, current_map)
+    current_map = join_all_sectors(current_map)
 
     return current_map
 
@@ -1376,7 +1492,7 @@ def create_new_ship(new_ship_class, owner, spawn_sector):
         ship_health = 500
         model = "Escape Pod"
         warp_drive_available = False
-        shields = 1
+        shields = 3
 
     elif new_ship_class == 1:  # Default starting ship
         total_holds = 1_000
@@ -1390,7 +1506,7 @@ def create_new_ship(new_ship_class, owner, spawn_sector):
                 spawn_sector, ship_name, False, ship_health, True,  warp_drive_available, shields, owner)
 
 
-def default_player_properties(sector_total):
+def default_player_properties():
 
     deployed_items = default_deployed.copy()
 
@@ -1398,43 +1514,132 @@ def default_player_properties(sector_total):
 
     tracked_limpets = []
 
-    turns_remaining, score, credits, starting_sector = 20_000, 0, 20_000, random.randint(
-        1, sector_total)
+    turns_remaining, score, credits, = 20_000, 0, 20_000
 
-    return deployed_items, corporation,  turns_remaining, score, credits, starting_sector, tracked_limpets
+    return deployed_items, corporation,  turns_remaining, score, credits,  tracked_limpets
 
 
-if __name__ == "__main__":
-
-    player_name = "Reshui"
-    total_sectors = 10_000
-
-    map_ = generate_map(total_sectors)
+def create_basic_pilot(player_name):
 
     deployed_items, corporation, turns_remaining, score, credits, starting_sector, tracked_limpets \
         = default_player_properties(total_sectors)
 
-    ship = create_new_ship(new_ship_class=1, owner=None,
-                           spawn_sector=starting_sector)
-    # Ideally these should all be retrieved from a databse of some sort
     user = Pilot(player_name,  credits,
                  turns_remaining, score, deployed_items, corporation,  tracked_limpets, None)
 
-    # Assigns the ship to the owner AND designates the player as the owner of the ship
-    user.assign_ship(ship)
+    return user
 
-    game_deployables = {}
 
-    game = Game(map_, {player_name: user}, game_deployables)
-
-    user.ship_sector().load_sector(
-        user, lessen_fighter_response=False, process_events=False)
+def get_input(prompt, allowed_range, return_number, return_lowered_string=False):
 
     while True:
 
-        player_input = input("Select Action:\t").lower()
+        user_input = input(prompt)
+
+        if return_number:
+
+            try:
+                user_input = int(user_input)
+            except ValueError:
+                print("Input a number.")
+                continue
+
+        elif return_lowered_string:
+            user_input = user_input.lower()
+
+        if allowed_range == None or user_input in allowed_range:
+            return user_input
+        else:
+            print("Invalid selection.")
+
+
+def send_client_message(client, msg):
+
+    message = msg.encode(FORMAT)
+    msg_length = len(message)
+    send_length = str(msg_length).encode(FORMAT)
+    # Pad len(message) so that it is as long as the header
+    send_length += b" " * HEADER-len(send_length)
+    client.send(send_length)  # Tell client how large the message will be
+    client.send(message)    # Send message
+
+
+def recieve_from_client(client):
+
+    msg_length = client.recv(HEADER).decode(FORMAT)
+
+    if msg_length:
+
+        msg_length = int(msg_length)
+
+        msg = client.recv(msg_length).decode(FORMAT)
+
+        if msg == DISCONNECT_MESSAGE:
+            client.close()
+            return False  # Ensure that clients disconnect cleanly
+        else:
+            return msg
+
+
+def handle_client(conn):
+    # get username and assign pilot object
+
+    username_prompt = "Enter Username"
+
+    send_client_message(conn, username_prompt)
+
+    user_name = recieve_from_client(conn)
+
+    if user_name not in game.active_players:
+
+        if user_name in game.players:
+            pass
+        else:
+            pilot = create_basic_pilot(user_name)
+            game.players[pilot.name] = pilot
+
+        game.active_players.append(pilot.name)
+
+    else:
+        return
+
+    pilot.ship_sector().load_sector(
+        pilot, lessen_fighter_response=False, process_events=True)
+
+    while True:
+
+        player_input = get_input("Select Action <?> :\t", None, False, True)
 
         if player_input == "0":
             break
         else:
-            user.check_input(player_input)
+            pilot.check_input(player_input)
+
+
+if "__main__" == __name__:
+
+    total_sectors = 1_000
+
+    map_ = generate_map(total_sectors)
+
+    game = Game(map_, None)
+
+    new_network = LocalNetwork()
+
+    server = new_network.server
+
+    server.listen()  # server now listening for connections
+
+    print(f"Server is listening on {new_network.server_ip}")
+
+    while True:
+
+        conn, addr = server.accept()  # waits until a new connection occurs
+
+        new_network.connected_clients.append(conn)
+
+        thread = threading.Thread(handle_client, args=(conn))
+
+        thread.start()
+
+        print(f"Active connections {threading.active_count()-1}")
